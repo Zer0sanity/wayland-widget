@@ -1,4 +1,5 @@
 const std = @import("std");
+const posix = std.posix;
 const lib = @import("wayland_widgit_lib");
 
 pub fn main() !void {
@@ -170,4 +171,116 @@ pub fn main() !void {
     const xdg_wm_base_id = xdg_wm_base_id_opt orelse return error.NeccessaryWaylandExtensionMissing;
 
     std.log.debug("wl_shm client id = {}; wl_compositor client id = {}; xdg_wm_base client id = {}", .{ shm_id, compositor_id, xdg_wm_base_id });
+
+    // Create a surface using wl_compositor::create_surface
+    const surface_id = next_id;
+    next_id += 1;
+    // https://wayland.app/protocols/wayland#wl_compositor:request:create_surface
+    const WL_COMPOSITOR_REQUEST_CREATE_SURFACE = 0;
+    try lib.writeRequest(socket, compositor_id, WL_COMPOSITOR_REQUEST_CREATE_SURFACE, &[_]u32{
+        // id: new_id<wl_surface>
+        surface_id,
+    });
+
+    // Create an xdg_surface
+    const xdg_surface_id = next_id;
+    next_id += 1;
+    // https://wayland.app/protocols/xdg-shell#xdg_wm_base:request:get_xdg_surface
+    const XDG_WM_BASE_REQUEST_GET_XDG_SURFACE = 2;
+    try lib.writeRequest(socket, xdg_wm_base_id, XDG_WM_BASE_REQUEST_GET_XDG_SURFACE, &[_]u32{
+        // id: new_id<xdg_surface>
+        xdg_surface_id,
+        // surface: object<wl_surface>
+        surface_id,
+    });
+
+    // Get the xdg_surface as an xdg_toplevel object
+    const xdg_toplevel_id = next_id;
+    next_id += 1;
+    // https://wayland.app/protocols/xdg-shell#xdg_surface:request:get_toplevel
+    const XDG_SURFACE_REQUEST_GET_TOPLEVEL = 1;
+    try lib.writeRequest(socket, xdg_surface_id, XDG_SURFACE_REQUEST_GET_TOPLEVEL, &[_]u32{
+        // id: new_id<xdg_surface>
+        xdg_toplevel_id,
+    });
+
+    // Commit the surface. This tells the compositor that the current batch of
+    // changes is ready, and they can now be applied.
+
+    // https://wayland.app/protocols/wayland#wl_surface:request:commit
+    const WL_SURFACE_REQUEST_COMMIT = 6;
+    try lib.writeRequest(socket, surface_id, WL_SURFACE_REQUEST_COMMIT, &[_]u32{});
+
+    while (true) {
+        const event = try lib.Event.read(socket, &message_buffer);
+
+        if (event.header.object_id == xdg_surface_id) {
+            switch (event.header.opcode) {
+                // https://wayland.app/protocols/xdg-shell#xdg_surface:event:configure
+                0 => {
+                    // This was not in the tutorial, but I found the opcode here
+                    // https://doc.servo.org/wayland_protocols/xdg/shell/client/xdg_surface/constant.REQ_ACK_CONFIGURE_OPCODE.html
+                    const REQ_ACK_CONFIGURE_OPCODE = 4;
+
+                    // The configure event acts as a heartbeat. Every once in a while the compositor will send us
+                    // a `configure` event, and if our application doesn't respond with an `ack_configure` response
+                    // it will assume our program has died and destroy the window.
+                    const serial: u32 = @bitCast(event.body[0..4].*);
+
+                    //try lib.writeRequest(socket, xdg_surface_id, XDG_SURFACE_REQUEST_ACK_CONFIGURE, &[_]u32{
+                    try lib.writeRequest(socket, xdg_surface_id, REQ_ACK_CONFIGURE_OPCODE, &[_]u32{
+                        // We respond with the number it sent us, so it knows which configure we are responding to.
+                        serial,
+                    });
+
+                    try lib.writeRequest(socket, surface_id, WL_SURFACE_REQUEST_COMMIT, &[_]u32{});
+
+                    // The surface has been configured! We can move on
+                    break;
+                },
+                else => return error.InvalidOpcode,
+            }
+        } else {
+            std.log.warn("unknown event {{ .object_id = {}, .opcode = {x}, .message = \"{}\" }}", .{ event.header.object_id, event.header.opcode, std.zig.fmtEscapes(std.mem.sliceAsBytes(event.body)) });
+        }
+    }
+
+    const Pixel = [4]u8;
+    const framebuffer_size = [2]usize{ 128, 128 };
+    const shared_memory_pool_len = framebuffer_size[0] * framebuffer_size[1] * @sizeOf(Pixel);
+    const shared_memory_pool_fd = posix.memfd_create("my-wayland-framebuffer", 0);
+    _ = posix.ftruncate(@intCast(shared_memory_pool_fd), shared_memory_pool_len);
+
+    // Create a wl_shm_pool (wayland shared memory pool). This will be used to create framebuffers,
+    // though in this article we only plan on creating one.
+    const wl_shm_pool_id = try lib.writeWlShmRequestCreatePool(
+        socket,
+        shm_id,
+        &next_id,
+        @intCast(shared_memory_pool_fd),
+        @intCast(shared_memory_pool_len),
+    );
+
+    // Now we allocate a framebuffer from the shared memory pool
+    const wl_buffer_id = next_id;
+    next_id += 1;
+
+    // https://wayland.app/protocols/wayland#wl_shm_pool:request:create_buffer
+    const WL_SHM_POOL_REQUEST_CREATE_BUFFER = 0;
+    // https://wayland.app/protocols/wayland#wl_shm:enum:format
+    const WL_SHM_POOL_ENUM_FORMAT_ARGB8888 = 0;
+    try lib.writeRequest(socket, wl_shm_pool_id, WL_SHM_POOL_REQUEST_CREATE_BUFFER, &[_]u32{
+        // id: new_id<wl_buffer>,
+        wl_buffer_id,
+        // Byte offset of the framebuffer in the pool. In this case we allocate it at the very start of the file.
+        0,
+        // Width of the framebuffer.
+        framebuffer_size[0],
+        // Height of the framebuffer.
+        framebuffer_size[1],
+        // Stride of the framebuffer, or rather, how many bytes are in a single row of pixels.
+        framebuffer_size[0] * @sizeOf(Pixel),
+        // The format of the framebuffer. In this case we choose argb8888.
+        WL_SHM_POOL_ENUM_FORMAT_ARGB8888,
+    });
 }
